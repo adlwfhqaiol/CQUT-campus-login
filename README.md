@@ -29,7 +29,7 @@
 ## 快速开始
 
 ```powershell
-git clone <你的仓库地址>
+git clone <https://github.com/adlwfhqaiol/cqut-campus-login>
 cd .\cqut-campus-login
 py -3 .\cqut_campus_login.py --init
 ```
