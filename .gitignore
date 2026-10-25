@@ -1,0 +1,44 @@
+# Local credentials and runtime data
+CQUTCampusLogin/
+credentials.bin
+settings.json
+login.log
+*.old.log
+edge-profile/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+coverage.xml
+.coverage
+htmlcov/
+
+# Node.js and browser test data
+node_modules/
+npm-debug.log*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Test artifacts
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
