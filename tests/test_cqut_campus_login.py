@@ -140,6 +140,12 @@ class CampusLoginTests(unittest.TestCase):
         self.assertIn('campus ""login"".py', content)
         self.assertIn("shell.Run cmd, 0, False", content)
 
+    def test_windows_launcher_uses_crlf(self):
+        launcher = Path(__file__).resolve().parent.parent / "启动校园网登录.cmd"
+        data = launcher.read_bytes()
+        self.assertTrue(data)
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+
     def test_credentials_refuse_plaintext_storage_off_windows(self):
         with mock.patch.object(app.os, "name", "posix"):
             with self.assertRaisesRegex(app.LoginError, "DPAPI"):
