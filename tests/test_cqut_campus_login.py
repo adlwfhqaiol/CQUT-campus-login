@@ -211,6 +211,7 @@ class CampusLoginTests(unittest.TestCase):
         options = run.call_args.kwargs
         self.assertNotIn("secret", arguments)
         self.assertIn('"password": "secret"', options["input"].decode("utf-8"))
+        self.assertIn('"serviceKeyword": "移动"', options["input"].decode("utf-8"))
         self.assertNotIn("CQUT_PASSWORD", options["env"])
         self.assertNotIn("CQUT_USERNAME", options["env"])
 

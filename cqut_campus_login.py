@@ -1323,6 +1323,7 @@ def edge_sso_login(
     username: str,
     password: str,
     logger: Logger,
+    service_keyword: str = "移动",
 ) -> str:
     node = shutil.which("node")
     helper = Path(__file__).with_name("edge_sso_login.mjs")
@@ -1334,6 +1335,7 @@ def edge_sso_login(
             "url": page_url,
             "username": username,
             "password": password,
+            "serviceKeyword": service_keyword,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -1375,6 +1377,28 @@ def edge_sso_login(
     logger.write(f"Edge 登录阶段：{result.get('stage', 'unknown')}，页面：{target}")
     for request in result.get("requests", [])[-12:]:
         logger.write(f"浏览器页面请求：{request}")
+    if str(result.get("stage") or "") != "success":
+        # 门户返回的页面内容属于外部输入，压平空白后只记录摘要。
+        title = str(result.get("title") or "").strip()
+        excerpt = re.sub(r"\s+", " ", str(result.get("text") or "")).strip()[:300]
+        if title or excerpt:
+            detail = f"页面标题：{title or '(空)'}"
+            if excerpt:
+                detail += f"；内容：{excerpt}"
+            logger.write(redact(detail, username, password, ""), "WARN")
+        action = str(result.get("serviceAction") or "").strip()
+        if action:
+            picked = str(result.get("servicePicked") or "").strip()
+            count = result.get("serviceCount")
+            query = str(result.get("serviceQuery") or "")
+            has_query = "wlanuserip" in query.lower()
+            detail = f"服务页处理：{action}"
+            if picked:
+                detail += f"，已选：{picked}"
+            if isinstance(count, int):
+                detail += f"，服务数：{count}"
+            detail += "，页面参数：" + ("完整" if has_query else "缺少 wlanuserip")
+            logger.write(redact(detail, username, password, ""), "WARN")
     if result.get("ok"):
         logger.write("Edge 已完成统一身份认证提交")
         if result.get("stage") == "success":
@@ -1614,7 +1638,13 @@ def login_once(
     # AC 下发的登录地址和会话可能只能用一次。必须先交给独立的浏览器会话，
     # 不能让 Python 先打开一遍再交给浏览器。
     if os.name == "nt":
-        edge_result = edge_sso_login(page_url, username, password, logger)
+        edge_result = edge_sso_login(
+            page_url,
+            username,
+            password,
+            logger,
+            str(settings.get("service_keyword", "移动")),
+        )
         if edge_result in (EDGE_SUCCESS, EDGE_SUBMITTED):
             if wait_for_online(settings, logger):
                 return True

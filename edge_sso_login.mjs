@@ -58,6 +58,10 @@ class DevTools {
       const message = JSON.parse(String(event.data));
       if (!message.id) {
         if (message.method) this.events.push(message);
+        if (message.method === "Page.javascriptDialogOpening") {
+          // 门户常用 alert 提示错误或成功；无人点击会卡住页面，直接确认掉。
+          this.send("Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
+        }
         return;
       }
       const pending = this.pending.get(message.id);
@@ -207,6 +211,117 @@ function fillLoginExpression(username, password) {
   })()`;
 }
 
+function handleServicePageExpression(keyword) {
+  return `(() => {
+    const byId = (id) => document.getElementById(id);
+    const clean = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const wanted = ${JSON.stringify(keyword || "移动")};
+    const aliases = {
+      "移动": ["mobile", "cmcc", "yidong"],
+      "电信": ["telecom", "dx", "dianxin"],
+      "联通": ["unicom", "lt", "liantong"],
+    };
+    const extra = aliases[wanted] || [];
+    const hit = (value) => {
+      const text = String(value || "");
+      return text.includes(wanted) || extra.some((alias) => text.toLowerCase().includes(alias));
+    };
+    const info = () => ({
+      selected: byId("net_access_type") ? String(byId("net_access_type").value || "") : "",
+      selectedText: clean(byId("selectDisname") && byId("selectDisname").innerHTML),
+      serviceCount:
+        typeof services !== "undefined" && Array.isArray(services) ? services.length : 0,
+      submitted: window.__cqutServiceSubmitted === true,
+      query: String(location.search || "").slice(0, 200),
+    });
+    const submit = () => {
+      if (window.__cqutServiceSubmitted) return "already";
+      const link = byId("loginLink");
+      if (!link) return "no-button";
+      window.__cqutServiceSubmitted = true;
+      setTimeout(() => link.click(), 200);
+      return "clicked";
+    };
+    const state = info();
+    // 服务已经选好（包括上一次尝试选好的），直接点页面上的登录按钮。
+    if (state.selected && state.selectedText && state.selectedText !== "请选择服务") {
+      return { ok: true, action: "login", submit: submit(), ...state };
+    }
+    // 服务列表已渲染：点文字匹配上运营商的那一项。
+    const items = [
+      ...document.querySelectorAll(
+        "#serviceContent [onclick], #serviceContent div, #serviceContent span, #serviceContent a, #serviceContent li"
+      ),
+    ];
+    const matches = items
+      .map((el) => {
+        const text = clean(el.innerText || el.textContent);
+        return {
+          el,
+          text,
+          raw: text + " " + (el.getAttribute("onclick") || ""),
+        };
+      })
+      .filter((x) => x.raw && hit(x.raw))
+      .sort((a, b) => a.text.length - b.text.length);
+    if (matches.length) {
+      const item = matches[0];
+      item.el.click();
+      if (!byId("net_access_type") || !byId("net_access_type").value) {
+        const code = item.el.getAttribute("onclick") || "";
+        const found = code.match(/selectService\\(\\s*'([^']+)'\\s*,\\s*'([^']*)'/);
+        if (found) {
+          const field = byId("net_access_type");
+          if (field) field.value = found[1];
+          const shown = byId("selectDisname");
+          if (shown && found[2]) shown.innerHTML = found[2];
+        }
+      }
+      return {
+        ok: true,
+        action: "select-login",
+        picked: item.text,
+        submit: submit(),
+        ...info(),
+      };
+    }
+    // 列表还在内存里：直接调用页面自己的 selectService 完成选择。
+    if (typeof services !== "undefined" && Array.isArray(services)) {
+      for (let i = 0; i < services.length; i += 1) {
+        const item = services[i] || {};
+        const name = String(item.serviceName || "");
+        const show = String(item.serviceShowName || "");
+        const label = name + " " + show;
+        if (hit(label) || /中国移动|移动|校园网|电信|联通/.test(label)) {
+          try {
+            selectService(name, show || name, i);
+          } catch (e) {
+            // 页面脚本可能因缺少运营商密码框而中断，下面直接写隐藏字段兜底。
+          }
+          const field = byId("net_access_type");
+          if (field) field.value = name;
+          const shown = byId("selectDisname");
+          if (shown) shown.innerHTML = show || name;
+          return {
+            ok: true,
+            action: "select-login",
+            picked: show || name,
+            submit: submit(),
+            ...info(),
+          };
+        }
+      }
+    }
+    // 服务列表还没拉下来：点开服务框，让页面自己去请求服务列表。
+    const top = byId("serviceShowHideTop");
+    if (top) {
+      top.click();
+      return { ok: false, action: "open", ...info() };
+    }
+    return { ok: false, action: "none", ...info() };
+  })()`;
+}
+
 async function main() {
   if (typeof WebSocket !== "function") {
     throw new Error("当前 Node.js 不支持内置 WebSocket，请升级到 Node.js 22 或更高版本");
@@ -252,9 +367,14 @@ async function main() {
     let submitted = false;
     let lastState = null;
     const deadline = Date.now() + 120000;
-    const formDeadline = Date.now() + 20000;
+    let formDeadline = Date.now() + 25000;
+    let triedRoot = false;
     let sawUisSuccess = false;
     let reloadedAfterSuccess = false;
+    let serviceAttempts = 0;
+    let lastServiceAttemptAt = 0;
+    let serviceProbe = null;
+    let serviceSubmitted = false;
     while (Date.now() < deadline) {
       await sleep(500);
       try {
@@ -309,12 +429,61 @@ async function main() {
         if (!result?.ok) throw new Error(result?.reason || "填写登录表单失败");
         submitted = true;
       }
+      const servicePage =
+        /请选择服务|选择服务/.test(text) || /选择服务/.test(lastState.title || "");
+      if (
+        !submitted &&
+        !serviceSubmitted &&
+        serviceAttempts < 6 &&
+        servicePage &&
+        Date.now() - lastServiceAttemptAt > 3000
+      ) {
+        // 门户有时不直接给登录表单，而是先要求选择运营商服务。
+        // 服务项藏在下拉框里，页面加载后由 getServices 动态填充；
+        // 这里按设置里的关键字选中服务，再点页面自己的登录按钮。
+        lastServiceAttemptAt = Date.now();
+        serviceAttempts += 1;
+        const picked = await devtools.evaluate(
+          handleServicePageExpression(input.serviceKeyword || "移动")
+        );
+        serviceProbe = picked;
+        if (picked?.action === "select-login" || picked?.action === "login") {
+          serviceSubmitted = true;
+          await sleep(2000);
+          continue;
+        }
+        await sleep(1200);
+        continue;
+      }
       if (!submitted && Date.now() >= formDeadline) {
+        if (!triedRoot) {
+          // 深链里的 AC 参数可能已经失效或只能用一次。像用户手动打开门户
+          // 那样，从门户根地址重新进入，让 AC 重新下发一套登录参数。
+          triedRoot = true;
+          try {
+            await devtools.send("Page.navigate", {
+              url: new URL(input.url).origin + "/",
+            });
+          } catch {
+            // 保留当前页面继续观察。
+          }
+          await sleep(2000);
+          formDeadline = Date.now() + 60000;
+          continue;
+        }
         process.stdout.write(JSON.stringify({
           ok: false,
           stage: "form-not-found",
           reason: "未进入统一认证登录表单",
           url: lastState?.url || "",
+          title: lastState?.title || "",
+          readyState: lastState?.ready || "",
+          text: (lastState?.text || "").slice(0, 1200),
+          serviceAction: serviceProbe?.action || "",
+          servicePicked: serviceProbe?.picked || "",
+          serviceSelected: serviceProbe?.selectedText || "",
+          serviceCount: serviceProbe?.serviceCount ?? null,
+          serviceQuery: serviceProbe?.query || "",
           requests: devtools.events
             .filter((event) => event.method === "Network.requestWillBeSent")
             .filter((event) => event.params?.type === "Document")
@@ -338,6 +507,14 @@ async function main() {
       ok: submitted,
       stage: submitted ? "submitted" : "form-not-found",
       url: lastState?.url || "",
+      title: lastState?.title || "",
+      readyState: lastState?.ready || "",
+      text: (lastState?.text || "").slice(0, 1200),
+      serviceAction: serviceProbe?.action || "",
+      servicePicked: serviceProbe?.picked || "",
+      serviceSelected: serviceProbe?.selectedText || "",
+      serviceCount: serviceProbe?.serviceCount ?? null,
+      serviceQuery: serviceProbe?.query || "",
       requests: devtools.events
         .filter((event) => event.method === "Network.requestWillBeSent")
         .filter((event) => event.params?.type === "Document")
