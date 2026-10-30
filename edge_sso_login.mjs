@@ -238,6 +238,12 @@ function handleServicePageExpression(keyword) {
       if (window.__cqutServiceSubmitted) return "already";
       const link = byId("loginLink");
       if (!link) return "no-button";
+      // 页面自己的 doauthen() 会把按钮 class 改成 *Clicked*；如果已经是这个
+      // 状态，说明登录正在提交（例如门户记住服务后自动提交），不要重复点。
+      if (String(link.className || "").indexOf("Clicked") >= 0) {
+        window.__cqutServiceSubmitted = true;
+        return "already";
+      }
       window.__cqutServiceSubmitted = true;
       setTimeout(() => link.click(), 200);
       return "clicked";
@@ -366,7 +372,12 @@ async function main() {
 
     let submitted = false;
     let lastState = null;
-    const deadline = Date.now() + 120000;
+    const startedAt = Date.now();
+    const hardDeadline = startedAt + 270000;
+    let deadline = startedAt + 180000;
+    const extendDeadline = (ms) => {
+      deadline = Math.min(Math.max(deadline, Date.now() + ms), hardDeadline);
+    };
     let formDeadline = Date.now() + 25000;
     let triedRoot = false;
     let sawUisSuccess = false;
@@ -428,11 +439,12 @@ async function main() {
         );
         if (!result?.ok) throw new Error(result?.reason || "填写登录表单失败");
         submitted = true;
+        // 表单提交后门户还要走 SSO 回跳，给后续步骤留出时间。
+        extendDeadline(60000);
       }
       const servicePage =
         /请选择服务|选择服务/.test(text) || /选择服务/.test(lastState.title || "");
       if (
-        !submitted &&
         !serviceSubmitted &&
         serviceAttempts < 6 &&
         servicePage &&
@@ -441,6 +453,8 @@ async function main() {
         // 门户有时不直接给登录表单，而是先要求选择运营商服务。
         // 服务项藏在下拉框里，页面加载后由 getServices 动态填充；
         // 这里按设置里的关键字选中服务，再点页面自己的登录按钮。
+        // 注意：SSO 表单提交后门户也可能回到这个页面，所以不能因为
+        // 已经提交过账号密码就跳过服务选择。
         lastServiceAttemptAt = Date.now();
         serviceAttempts += 1;
         const picked = await devtools.evaluate(
@@ -449,13 +463,15 @@ async function main() {
         serviceProbe = picked;
         if (picked?.action === "select-login" || picked?.action === "login") {
           serviceSubmitted = true;
+          // 选完服务点登录后，门户还要提交 loginOfCas，继续观察一段时间。
+          extendDeadline(90000);
           await sleep(2000);
           continue;
         }
         await sleep(1200);
         continue;
       }
-      if (!submitted && Date.now() >= formDeadline) {
+      if (!submitted && !serviceSubmitted && Date.now() >= formDeadline) {
         if (!triedRoot) {
           // 深链里的 AC 参数可能已经失效或只能用一次。像用户手动打开门户
           // 那样，从门户根地址重新进入，让 AC 重新下发一套登录参数。

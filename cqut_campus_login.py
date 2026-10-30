@@ -65,6 +65,7 @@ EDGE_SUCCESS = "success"
 EDGE_SUBMITTED = "submitted"
 EDGE_NO_FORM = "no-form"
 EDGE_UNAVAILABLE = "unavailable"
+EDGE_NETWORK_ERROR = "network-error"
 
 PROBES = (
     ("http://connect.rom.miui.com/generate_204", 204, None),
@@ -1348,7 +1349,7 @@ def edge_sso_login(
             [node, str(helper)],
             input=payload,
             capture_output=True,
-            timeout=150,
+            timeout=300,
             env=child_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -1399,6 +1400,17 @@ def edge_sso_login(
                 detail += f"，服务数：{count}"
             detail += "，页面参数：" + ("完整" if has_query else "缺少 wlanuserip")
             logger.write(redact(detail, username, password, ""), "WARN")
+    result_url = str(result.get("url") or "")
+    result_text = str(result.get("text") or "")
+    if (
+        result_url.startswith("chrome-error")
+        or "chromewebdata" in result_url
+        or "ERR_CONNECTION" in result_text
+        or "无法访问此页面" in result_text
+    ):
+        # 门户或统一认证页面根本没能打开，凭据没有提交过，没必要等放行。
+        logger.write("浏览器未能打开门户页面（网络连接异常），稍后重试", "WARN")
+        return EDGE_NETWORK_ERROR
     if result.get("ok"):
         logger.write("Edge 已完成统一身份认证提交")
         if result.get("stage") == "success":
@@ -1660,6 +1672,8 @@ def login_once(
             raise PendingReleaseError(
                 "门户未返回登录表单，且外网仍未放行；先等待，不重复提交"
             )
+        if edge_result == EDGE_NETWORK_ERROR:
+            raise LoginError("门户或统一认证页面暂时无法访问，稍后重试")
         logger.write("浏览器登录未完成，尝试直接 SSO 接口", "WARN")
 
     page = follow_get(

@@ -178,6 +178,32 @@ class CampusLoginTests(unittest.TestCase):
                         )
                 sso.assert_not_called()
 
+    def test_edge_network_error_is_reported_separately(self):
+        completed = mock.Mock(
+            stdout=(
+                '{"ok":false,"stage":"form-not-found",'
+                '"url":"chrome-error://chromewebdata/",'
+                '"title":"sid.cqut.edu.cn",'
+                '"text":"ERR_CONNECTION_CLOSED"}\n'
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            logger = app.Logger(quiet=True, path=Path(directory) / "login.log")
+            with (
+                mock.patch.object(app.shutil, "which", return_value="node"),
+                mock.patch.object(app.subprocess, "run", return_value=completed),
+            ):
+                self.assertEqual(
+                    app.edge_sso_login(
+                        "http://202.202.145.132/eportal/index.jsp",
+                        "student",
+                        "secret",
+                        logger,
+                    ),
+                    app.EDGE_NETWORK_ERROR,
+                )
+
     def test_credentials_refuse_plaintext_storage_off_windows(self):
         with mock.patch.object(app.os, "name", "posix"):
             with self.assertRaisesRegex(app.LoginError, "DPAPI"):
