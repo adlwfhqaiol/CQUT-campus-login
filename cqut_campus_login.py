@@ -55,8 +55,16 @@ DEFAULT_SETTINGS = {
     "request_timeout": 8,
     "max_captcha_attempts": 6,
     "password_length": 10,
-    "post_login_wait_seconds": 90,
+    "post_login_wait_seconds": 240,
 }
+
+# Edge 登录助手的结果：只有前两种表示已经向学校提交过认证。
+# 提交后门户往往还要一段时间才放行，这段时间里不能再开新的登录会话，
+# 否则会制造互相冲突的会话，反而拖慢放行。
+EDGE_SUCCESS = "success"
+EDGE_SUBMITTED = "submitted"
+EDGE_NO_FORM = "no-form"
+EDGE_UNAVAILABLE = "unavailable"
 
 PROBES = (
     ("http://connect.rom.miui.com/generate_204", 204, None),
@@ -310,6 +318,10 @@ class LoginError(RuntimeError):
 
 class CredentialError(LoginError):
     pass
+
+
+class PendingReleaseError(LoginError):
+    """凭据已通过认证，但门户/AC 尚未放行。"""
 
 
 class Session:
@@ -1254,7 +1266,7 @@ def sso_login(
         logger.write(f"SSO 回跳完成：HTTP {portal_response.status}")
         deadline = time.monotonic() + max(
             5,
-            int(settings.get("post_login_wait_seconds", 90)),
+            int(settings.get("post_login_wait_seconds", 240)),
         )
         verification_session = Session(
             min(4.0, float(settings.get("request_timeout", 8)))
@@ -1265,7 +1277,7 @@ def sso_login(
                 logger.write("认证成功，外网已经连通", "OK")
                 return True
             time.sleep(2)
-        raise LoginError("统一身份认证已通过，但校园网门户仍未完成放行")
+        raise PendingReleaseError("统一身份认证已通过，但校园网门户仍未完成放行")
     safe_message = redact(message, username, password, "")
     if code == "16300":
         raise LoginError("学校要求二次验证，当前脚本无法自动完成")
@@ -1285,11 +1297,15 @@ def sso_login(
     )
 
 
-def wait_for_online(settings: dict, logger: Logger) -> bool:
-    deadline = time.monotonic() + max(
-        5,
-        int(settings.get("post_login_wait_seconds", 90)),
-    )
+def wait_for_online(
+    settings: dict,
+    logger: Logger,
+    seconds: float | None = None,
+) -> bool:
+    wait_seconds = int(settings.get("post_login_wait_seconds", 240))
+    if seconds is not None:
+        wait_seconds = int(seconds)
+    deadline = time.monotonic() + max(5, wait_seconds)
     verification_session = Session(
         min(4.0, float(settings.get("request_timeout", 8)))
     )
@@ -1307,12 +1323,12 @@ def edge_sso_login(
     username: str,
     password: str,
     logger: Logger,
-) -> bool:
+) -> str:
     node = shutil.which("node")
     helper = Path(__file__).with_name("edge_sso_login.mjs")
     if not node or not helper.exists():
         logger.write("未找到 Node.js 或 Edge 登录助手，尝试直接 SSO", "WARN")
-        return False
+        return EDGE_UNAVAILABLE
     payload = json.dumps(
         {
             "url": page_url,
@@ -1336,7 +1352,7 @@ def edge_sso_login(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.write(f"Edge 登录助手启动失败：{exc}", "WARN")
-        return False
+        return EDGE_UNAVAILABLE
     lines = [
         line.strip()
         for line in completed.stdout.decode("utf-8", "replace").splitlines()
@@ -1344,12 +1360,12 @@ def edge_sso_login(
     ]
     if not lines:
         logger.write("Edge 登录助手没有返回结果", "WARN")
-        return False
+        return EDGE_UNAVAILABLE
     try:
         result = json.loads(lines[-1])
     except ValueError:
         logger.write("Edge 登录助手返回了无法识别的结果", "WARN")
-        return False
+        return EDGE_UNAVAILABLE
     result_url = str(result.get("url") or "")
     if result_url:
         parts = urllib.parse.urlsplit(result_url)
@@ -1361,7 +1377,9 @@ def edge_sso_login(
         logger.write(f"浏览器页面请求：{request}")
     if result.get("ok"):
         logger.write("Edge 已完成统一身份认证提交")
-        return True
+        if result.get("stage") == "success":
+            return EDGE_SUCCESS
+        return EDGE_SUBMITTED
     message = redact(
         str(result.get("error") or result.get("reason") or "SSO 登录失败"),
         username,
@@ -1370,8 +1388,11 @@ def edge_sso_login(
     )
     if any(word in message for word in ("密码", "账号", "用户信息不存在")):
         raise CredentialError("统一身份认证拒绝了账号或密码：" + message)
+    if str(result.get("stage") or "") == "form-not-found":
+        logger.write("Edge 已打开门户，但门户没有返回登录表单", "WARN")
+        return EDGE_NO_FORM
     logger.write("Edge SSO 登录未完成：" + message, "WARN")
-    return False
+    return EDGE_UNAVAILABLE
 
 
 def decode_png_rgb(data: bytes) -> tuple[int, int, list[bytes]]:
@@ -1593,8 +1614,22 @@ def login_once(
     # AC 下发的登录地址和会话可能只能用一次。必须先交给独立的浏览器会话，
     # 不能让 Python 先打开一遍再交给浏览器。
     if os.name == "nt":
-        if edge_sso_login(page_url, username, password, logger):
-            return wait_for_online(settings, logger)
+        edge_result = edge_sso_login(page_url, username, password, logger)
+        if edge_result in (EDGE_SUCCESS, EDGE_SUBMITTED):
+            if wait_for_online(settings, logger):
+                return True
+            raise PendingReleaseError(
+                "统一身份认证已提交，但校园网门户尚未放行；先等待，不重复提交"
+            )
+        if edge_result == EDGE_NO_FORM:
+            # 门户不再给出登录表单，通常说明这台设备已有认证会话正在放行。
+            # 这时换另一条通道再登录会制造冲突会话，所以只观察、不重提。
+            logger.write("门户未返回登录表单，先等待现有会话放行", "WARN")
+            if wait_for_online(settings, logger):
+                return True
+            raise PendingReleaseError(
+                "门户未返回登录表单，且外网仍未放行；先等待，不重复提交"
+            )
         logger.write("浏览器登录未完成，尝试直接 SSO 接口", "WARN")
 
     page = follow_get(
@@ -1823,6 +1858,15 @@ def watch(
                 "ERROR",
             )
             return
+        except PendingReleaseError as exc:
+            # 认证已经提交过，门户只是还没放行。此时再开新会话会互相冲突，
+            # 所以只轮询联网状态，等放行窗口过去后才允许重新提交。
+            logger.write(str(exc), "WARN")
+            logger.write("门户可能仍在放行中，暂停重复提交，仅轮询联网状态")
+            if wait_for_online(settings, logger, seconds=max(60, interval * 2)):
+                delay = interval
+            else:
+                delay = max(interval, 120)
         except LoginError as exc:
             logger.write(str(exc), "WARN")
             warmup_left = warmup - (time.monotonic() - start)

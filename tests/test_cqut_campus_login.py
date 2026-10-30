@@ -146,6 +146,38 @@ class CampusLoginTests(unittest.TestCase):
         self.assertTrue(data)
         self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
 
+    def test_submitted_login_does_not_resubmit_through_sso(self):
+        location = (
+            "http://202.202.145.132/eportal/index.jsp?"
+            "wlanuserip=10.0.0.2&wlanacname=ac1"
+        )
+        for edge_result in (app.EDGE_SUBMITTED, app.EDGE_NO_FORM):
+            with self.subTest(edge_result=edge_result):
+                with (
+                    mock.patch.object(app.os, "name", "nt"),
+                    mock.patch.object(app, "check_online", return_value=(False, "")),
+                    mock.patch.object(
+                        app,
+                        "find_portal_location",
+                        return_value=(location, "wlanuserip=10.0.0.2"),
+                    ),
+                    mock.patch.object(
+                        app, "edge_sso_login", return_value=edge_result
+                    ),
+                    mock.patch.object(app, "wait_for_online", return_value=False),
+                    mock.patch.object(app, "sso_login") as sso,
+                ):
+                    with self.assertRaises(app.PendingReleaseError):
+                        app.login_once(
+                            mock.Mock(),
+                            app.DEFAULT_SETTINGS,
+                            "student",
+                            "password",
+                            mock.Mock(),
+                            interactive=False,
+                        )
+                sso.assert_not_called()
+
     def test_credentials_refuse_plaintext_storage_off_windows(self):
         with mock.patch.object(app.os, "name", "posix"):
             with self.assertRaisesRegex(app.LoginError, "DPAPI"):
@@ -166,13 +198,14 @@ class CampusLoginTests(unittest.TestCase):
                     {"CQUT_USERNAME": "student", "CQUT_PASSWORD": "secret"},
                 ),
             ):
-                self.assertTrue(
+                self.assertEqual(
                     app.edge_sso_login(
                         "https://uis.cqut.edu.cn/login",
                         "student",
                         "secret",
                         logger,
-                    )
+                    ),
+                    app.EDGE_SUCCESS,
                 )
         arguments = run.call_args.args[0]
         options = run.call_args.kwargs
